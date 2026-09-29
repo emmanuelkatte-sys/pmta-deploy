@@ -1,0 +1,8 @@
+*.tar.gz
+*.deb
+*.rpm
+*.log
+*.tmp
+.DS_Store
+.idea/
+.vscode/

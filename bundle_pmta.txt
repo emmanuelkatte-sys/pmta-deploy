@@ -1,0 +1,4 @@
+# PowerMTA bundle. SHA256 is the local tar; frozen EXE uses BUNDLE_URL.
+# BUNDLE_BUNDLED='pmta-bundle-v1.4.tar.gz'
+BUNDLE_SHA256='3501cff95f3118abce207625b1f1883e635db1f4588acd2df59908a444f5de01'
+BUNDLE_URL='https://github.com/hi30998946/warship/releases/download/v1.4/pmta-bundle-v1.4.tar.gz'
