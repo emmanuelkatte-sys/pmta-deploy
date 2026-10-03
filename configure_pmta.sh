@@ -1373,9 +1373,149 @@ sudo systemctl daemon-reload
 sudo systemctl enable pmta-tg 2>/dev/null || true
 sudo systemctl restart pmta-tg 2>/dev/null || true
 
+# RFC 8058 / RFC 2369 One-Click Unsubscribe Web Service for PowerMTA
+echo "部署 PowerMTA RFC 8058 退订服务..."
+mkdir -p /opt/pmta/unsub/logs
+cat > /opt/pmta/unsub/unsub_service.py << 'EOFPYUNSUB'
+import sys, os, time, datetime, urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+LOG_DIR = "/opt/pmta/unsub/logs"
+CSV_FILE = os.path.join(LOG_DIR, "unsubscribed.csv")
+
+def ensure_log():
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        if not os.path.exists(CSV_FILE):
+            with open(CSV_FILE, "w", encoding="utf-8") as f:
+                f.write("TimeISO,Email,IP,Method,UserAgent\n")
+    except Exception:
+        pass
+
+def record_unsub(email, ip, method, ua):
+    if not email or "@" not in email:
+        return
+    clean_email = email.strip().lower()
+    try:
+        ensure_log()
+        ts = datetime.datetime.utcnow().isoformat() + "Z"
+        line = f'"{ts}","{clean_email.replace(\'"\', \'""\')}","{ip}","{method}","{ua.replace(\'"\', \'""\')}"\n'
+        with open(CSV_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>配信停止の手続き完了 - Unsubscribed</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN", "Hiragino Sans", "BIZ UDPGothic", Meiryo, sans-serif; background: #0b0f19; color: #f1f5f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
+        .card { background: #161e2e; border: 1px solid #283548; border-radius: 16px; padding: 40px 32px; max-width: 480px; width: 100%; text-align: center; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6); }
+        .icon { width: 64px; height: 64px; background: rgba(34, 197, 94, 0.15); color: #22c55e; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 30px; margin-bottom: 20px; }
+        h1 { font-size: 20px; font-weight: 600; margin: 0 0 6px 0; color: #ffffff; letter-spacing: 0.02em; }
+        .sub { font-size: 13px; color: #64748b; margin: 0 0 18px 0; font-weight: 500; }
+        p { font-size: 14px; color: #94a3b8; line-height: 1.7; margin: 0 0 16px 0; }
+        .email-badge { display: inline-block; background: #0f172a; border: 1px solid #334155; color: #38bdf8; padding: 6px 14px; border-radius: 9999px; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; margin-bottom: 18px; word-break: break-all; }
+        .note { font-size: 12px; color: #94a3b8; line-height: 1.6; margin-top: 18px; text-align: left; background: rgba(15, 23, 42, 0.6); padding: 12px 14px; border-radius: 8px; border-left: 3px solid #38bdf8; }
+        .footer { font-size: 11px; color: #475569; border-top: 1px solid #283548; padding-top: 16px; margin-top: 24px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="icon">&#10003;</div>
+        <h1>配信停止の手続きが完了しました</h1>
+        <div class="sub">Unsubscription Completed</div>
+        <p>お客様のメールアドレスへのご案内メールの配信を停止いたしました。<br>これ以降、本配信リストからのメールは届きません。</p>
+        __BADGE__
+        <div class="note">※ 反映に数時間程度かかる場合がございます。万が一メールが届いた場合は、お手数ですが再度ご連絡ください。</div>
+        <div class="footer">RFC 8058 One-Click List-Unsubscribe Service</div>
+    </div>
+</body>
+</html>"""
+
+class UnsubHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        email = qs.get("email", [""])[0] or qs.get("addr", [""])[0] or qs.get("id", [""])[0]
+        ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
+        ua = self.headers.get("User-Agent", "")
+        if email:
+            record_unsub(email, ip, "GET", ua)
+        badge = f'<div class="email-badge">{email}</div>' if email and "@" in email else ""
+        content = HTML_TEMPLATE.replace("__BADGE__", badge).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
+        self.end_headers()
+        self.wfile.write(content)
+
+    def do_POST(self):
+        content_len = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_len).decode("utf-8", errors="ignore") if content_len > 0 else ""
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        post_data = urllib.parse.parse_qs(body)
+        email = qs.get("email", [""])[0] or post_data.get("email", [""])[0] or qs.get("id", [""])[0]
+        ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",")[0].strip()
+        ua = self.headers.get("User-Agent", "")
+        if email:
+            record_unsub(email, ip, "POST", ua)
+        msg = b"Unsubscribed successfully\r\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(msg)))
+        self.end_headers()
+        self.wfile.write(msg)
+
+if __name__ == "__main__":
+    ensure_log()
+    import threading
+    def run_server(port):
+        try:
+            s = HTTPServer(("0.0.0.0", port), UnsubHandler)
+            s.serve_forever()
+        except Exception:
+            pass
+    t = threading.Thread(target=run_server, args=(80,), daemon=True)
+    t.start()
+    run_server(9091)
+EOFPYUNSUB
+chmod 755 /opt/pmta/unsub/unsub_service.py
+
+cat > /etc/systemd/system/pmta-unsub.service << 'EOF'
+[Unit]
+Description=PowerMTA RFC 8058 One-Click Unsubscribe Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/pmta/unsub/unsub_service.py
+Restart=always
+RestartSec=3
+WorkingDirectory=/opt/pmta/unsub
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable pmta-unsub 2>/dev/null || true
+sudo systemctl restart pmta-unsub 2>/dev/null || true
+
 # 配置防火墙
 echo "配置防火墙规则..."
-sudo iptables -A INPUT -m state --state NEW -p tcp -m multiport --dports 25,587,2525,1983 -j ACCEPT
+sudo iptables -A INPUT -m state --state NEW -p tcp -m multiport --dports 25,80,587,2525,9091 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 1983 ! -s 127.0.0.1 -j DROP 2>/dev/null || true
+which ufw >/dev/null 2>&1 && sudo ufw deny 1983/tcp 2>/dev/null || true
+which ufw >/dev/null 2>&1 && sudo ufw allow 80/tcp 2>/dev/null || true
+which ufw >/dev/null 2>&1 && sudo ufw allow 9091/tcp 2>/dev/null || true
 sudo netfilter-persistent save 2>/dev/null || true
 
 # 验证PowerMTA服务状态
